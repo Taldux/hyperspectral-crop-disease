@@ -12,3 +12,7 @@ wheels/
 # Data files
 # kaggle.com/competitions/beyond-visible-spectrum-ai-for-agriculture-2025p2/data
 *.npy
+*.txt
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints/
