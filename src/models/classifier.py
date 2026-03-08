@@ -20,7 +20,8 @@ class PositionalEncoding(nn.Module):
         self.register_buffer("pe", pe.unsqueeze(0))  # (1, max_len, d_model)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return x + self.pe[:, : x.size(1)]
+        pe: torch.Tensor = self.pe  # type: ignore[assignment]
+        return x + pe[:, : x.size(1)]
 
 
 class HybridCNNTransformer(nn.Module):
