@@ -13,6 +13,8 @@ from pathlib import Path
 
 import torch
 from torch import nn, optim
+from torch.amp.autocast_mode import autocast
+from torch.amp.grad_scaler import GradScaler
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
@@ -80,7 +82,7 @@ def train_one_epoch(
     criterion: nn.Module,
     optimizer: optim.Optimizer,
     device: torch.device,
-    scaler: torch.amp.GradScaler | None,
+    scaler: GradScaler | None,
 ) -> tuple[float, float]:
     model.train()
     running_loss = 0.0
@@ -94,7 +96,7 @@ def train_one_epoch(
         optimizer.zero_grad(set_to_none=True)
 
         if scaler is not None:
-            with torch.amp.autocast("cuda"):
+            with autocast("cuda"):
                 outputs = model(inputs)
                 loss = criterion(outputs, labels)
             scaler.scale(loss).backward()
@@ -185,7 +187,7 @@ def main():
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
 
     # Mixed precision on CUDA
-    scaler = torch.amp.GradScaler("cuda") if device.type == "cuda" else None
+    scaler = GradScaler("cuda") if device.type == "cuda" else None
 
     # Resume
     start_epoch = 0
