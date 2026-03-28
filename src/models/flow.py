@@ -34,6 +34,8 @@ class ActNorm(nn.Module):
     per-channel output has zero mean and unit variance.
     """
 
+    initialized: torch.Tensor
+
     def __init__(self, num_channels: int):
         super().__init__()
         self.log_scale = nn.Parameter(torch.zeros(1, num_channels, 1, 1))
@@ -71,6 +73,12 @@ class Invertible1x1Conv(nn.Module):
     W = P @ L @ (U + diag(sign_s * exp(log_s)))
     log|det(W)| = sum(log_s), computed in O(C) time.
     """
+
+    P: torch.Tensor
+    sign_s: torch.Tensor
+    L_mask: torch.Tensor
+    U_mask: torch.Tensor
+    eye: torch.Tensor
 
     def __init__(self, num_channels: int):
         super().__init__()
@@ -143,7 +151,8 @@ class CouplingNetwork(nn.Module):
         self.class_proj = nn.Linear(class_embed_dim, hidden_channels)
 
         nn.init.zeros_(self.out_conv.weight)
-        nn.init.zeros_(self.out_conv.bias)
+        if self.out_conv.bias is not None:
+            nn.init.zeros_(self.out_conv.bias)
 
     def forward(self, x: torch.Tensor, c_embed: torch.Tensor) -> torch.Tensor:
         h = self.net(x)
@@ -323,9 +332,10 @@ class ConditionalGlow(nn.Module):
         h = x
         for s, steps in enumerate(self.flow_scales):
             h = squeeze(h)
-            for step in steps:
+            assert isinstance(steps, nn.ModuleList)
+            for step in list(steps):
                 if self.use_grad_checkpoint and self.training:
-                    h, ld = grad_checkpoint(
+                    h, ld = grad_checkpoint(  # type: ignore[misc]
                         step, h, c_embed, False, use_reentrant=False
                     )
                 else:
@@ -360,7 +370,9 @@ class ConditionalGlow(nn.Module):
         for s in reversed(range(self.num_scales)):
             if s < self.num_scales - 1:
                 h = torch.cat([z_list[s], h], dim=1)
-            for step in reversed(self.flow_scales[s]):
+            scale_steps = self.flow_scales[s]
+            assert isinstance(scale_steps, nn.ModuleList)
+            for step in reversed(list(scale_steps)):
                 h, _ = step(h, c_embed, reverse=True)
             h = unsqueeze(h)
 
@@ -426,7 +438,10 @@ def glow_nll_loss(
     """
     total_dims = sum(z.shape[1] * z.shape[2] * z.shape[3] for z in z_list)
 
-    prior = sum(0.5 * (z**2).sum(dim=[1, 2, 3]) for z in z_list)  # (B,)
+    prior: torch.Tensor = sum(  # type: ignore[assignment]
+        (0.5 * (z**2).sum(dim=[1, 2, 3]) for z in z_list),
+        torch.tensor(0.0),
+    )
     nll = (prior - log_det) / total_dims  # (B,) nats/dim
 
     return (
