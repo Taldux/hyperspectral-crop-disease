@@ -1,270 +1,436 @@
 """
-Conditional Normalizing Flow for hyperspectral data generation.
-"""
-"""
-Conditional Normalizing Flow for hyperspectral data generation.
+Conditional normalizing flow for hyperspectral image generation.
+
+Implements a multi-scale Glow architecture adapted for 
+125-band hyperspectral images at 128x128 resolution. Class-conditional
+generation is achieved by injecting disease severity labels into the affine
+coupling layers.
+
+Architecture (default config):
+    Input: (B, 125, 128, 128)
+    Scale 0: squeeze -> (B, 500, 64, 64)  -> K flow steps -> split
+    Scale 1: squeeze -> (B, 1000, 32, 32) -> K flow steps -> split
+    Scale 2: squeeze -> (B, 2000, 16, 16) -> K flow steps -> final z
+
+Each flow step: ActNorm -> Invertible 1x1 Conv (LU) -> Affine Coupling
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader, Subset
-import numpy as np
-from pathlib import Path
-import random
-
-# ======================
-# Dataset
-# ======================
-
-class HyperSpectralDataset(Dataset):
-
-    def __init__(self, root):
-        self.samples = []
-        root = Path(root)
-
-        for class_dir in sorted(root.iterdir()):
-            if class_dir.is_dir():
-                label = int(class_dir.name)
-                for file in class_dir.glob("*.npy"):
-                    self.samples.append((file, label))
-
-    def __len__(self):
-        return len(self.samples)
-
-    def __getitem__(self, idx):
-
-        file, label = self.samples[idx]
-
-        data = np.load(file).astype(np.float32) / 4000.0
-        data = data[:32, :32, :]  # crop
-
-        data = torch.tensor(data).permute(2,0,1)
-
-        return data, label
+from torch.utils.checkpoint import checkpoint as grad_checkpoint
 
 
-# ======================
-# Subset (30%)
-# ======================
-
-def get_subset(dataset, percent=0.3):
-
-    size = int(len(dataset) * percent)
-
-    indices = random.sample(range(len(dataset)), size)
-
-    return Subset(dataset, indices)
+# ---------------------------------------------------------------------------
+# Building blocks
+# ---------------------------------------------------------------------------
 
 
-# ======================
-# DataLoader
-# ======================
+class ActNorm(nn.Module):
+    """
+    Activation normalization with data-dependent initialization.
 
-data_dir = Path("../data/beyond-visible-spectrum-ai-for-agriculture-2025p2/Train")
+    On the first forward pass the parameters are initialized so that the
+    per-channel output has zero mean and unit variance.
+    """
 
-dataset = HyperSpectralDataset(data_dir)
-
-small_dataset = get_subset(dataset, percent=0.3)
-
-train_loader = DataLoader(
-    small_dataset,
-    batch_size=4,
-    shuffle=True
-)
-
-print("Subset size:", len(small_dataset))
-
-
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-# ====================================================
-# 1️⃣ Conditional VAE
-# ====================================================
-
-class VAE(nn.Module):
-
-    def __init__(self, latent_dim=128):
-
+    def __init__(self, num_channels: int):
         super().__init__()
+        self.log_scale = nn.Parameter(torch.zeros(1, num_channels, 1, 1))
+        self.bias = nn.Parameter(torch.zeros(1, num_channels, 1, 1))
+        self.register_buffer("initialized", torch.tensor(False))
 
-        input_dim = 125*32*32
+    def _initialize(self, x: torch.Tensor):
+        with torch.no_grad():
+            mean = x.mean(dim=[0, 2, 3], keepdim=True)
+            std = x.std(dim=[0, 2, 3], keepdim=True) + 1e-6
+            self.bias.data.copy_(-mean)
+            self.log_scale.data.copy_(-torch.log(std))
+            self.initialized.fill_(True)
 
-        self.encoder = nn.Sequential(
-            nn.Linear(input_dim+10,1024),
-            nn.ReLU(),
-            nn.Linear(1024,512),
-            nn.ReLU()
-        )
+    def forward(
+        self, x: torch.Tensor, reverse: bool = False
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if not self.initialized and not reverse:
+            self._initialize(x)
 
-        self.mu = nn.Linear(512,latent_dim)
-        self.logvar = nn.Linear(512,latent_dim)
+        _, _, H, W = x.shape
+        # log_det is the same for every sample in the batch (scalar, broadcasts)
+        log_det = H * W * self.log_scale.sum()
 
-        self.decoder = nn.Sequential(
-            nn.Linear(latent_dim+10,512),
-            nn.ReLU(),
-            nn.Linear(512,1024),
-            nn.ReLU(),
-            nn.Linear(1024,input_dim)
-        )
-
-    def forward(self,x,c):
-
-        x = x.view(x.size(0),-1)
-
-        h = torch.cat([x,c],dim=1)
-
-        h = self.encoder(h)
-
-        mu = self.mu(h)
-        logvar = self.logvar(h)
-
-        std = torch.exp(0.5*logvar)
-        eps = torch.randn_like(std)
-
-        z = mu + eps*std
-
-        z = torch.cat([z,c],dim=1)
-
-        recon = self.decoder(z)
-
-        return recon, mu, logvar
-
-    def loss(self,x,labels):
-
-        x = x.to(device)
-
-        c = F.one_hot(labels,10).float().to(device)
-
-        recon,mu,logvar = self.forward(x,c)
-
-        x = x.view(x.size(0),-1)
-
-        recon_loss = F.mse_loss(recon,x)
-
-        kl = -0.5 * torch.mean(1+logvar-mu.pow(2)-logvar.exp())
-
-        return recon_loss + kl
+        if not reverse:
+            return x * torch.exp(self.log_scale) + self.bias, log_det
+        else:
+            return (x - self.bias) * torch.exp(-self.log_scale), -log_det
 
 
-# ====================================================
-# 2️⃣ GAN
-# ====================================================
+class Invertible1x1Conv(nn.Module):
+    """
+    Invertible 1x1 convolution using LU decomposition.
 
-class Generator(nn.Module):
+    W = P @ L @ (U + diag(sign_s * exp(log_s)))
+    log|det(W)| = sum(log_s), computed in O(C) time.
+    """
 
-    def __init__(self):
-
+    def __init__(self, num_channels: int):
         super().__init__()
+        self.num_channels = num_channels
 
+        # Initialise from a random orthogonal matrix
+        W = torch.linalg.qr(torch.randn(num_channels, num_channels))[0]
+        P, L, U = torch.linalg.lu(W)
+        s = torch.diag(U)
+
+        self.register_buffer("P", P)
+        self.register_buffer("sign_s", torch.sign(s))
+        self.register_buffer(
+            "L_mask", torch.tril(torch.ones_like(L), diagonal=-1)
+        )
+        self.register_buffer(
+            "U_mask", torch.triu(torch.ones_like(U), diagonal=1)
+        )
+        self.register_buffer("eye", torch.eye(num_channels))
+
+        self.log_s = nn.Parameter(torch.log(torch.abs(s)))
+        self.L = nn.Parameter(L)
+        self.U = nn.Parameter(U)
+
+    def _weight(self) -> torch.Tensor:
+        L = self.L * self.L_mask + self.eye
+        U = self.U * self.U_mask + torch.diag(
+            self.sign_s * torch.exp(self.log_s)
+        )
+        return self.P @ L @ U
+
+    def forward(
+        self, x: torch.Tensor, reverse: bool = False
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        _, _, H, W = x.shape
+        log_det = H * W * self.log_s.sum()
+
+        if not reverse:
+            weight = self._weight()
+            return F.conv2d(x, weight.unsqueeze(-1).unsqueeze(-1)), log_det
+        else:
+            inv_weight = torch.inverse(self._weight())
+            return F.conv2d(x, inv_weight.unsqueeze(-1).unsqueeze(-1)), -log_det
+
+
+class CouplingNetwork(nn.Module):
+    """
+    Small CNN that parameterises the affine coupling transform.
+
+    Class embedding is injected as a spatially-broadcast additive bias.
+    The output convolution is zero-initialised so the coupling starts as the
+    identity transform.
+    """
+
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        hidden_channels: int,
+        class_embed_dim: int,
+    ):
+        super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(128+10,512),
-            nn.ReLU(),
-            nn.Linear(512,1024),
-            nn.ReLU(),
-            nn.Linear(1024,125*32*32)
+            nn.Conv2d(in_channels, hidden_channels, 3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(hidden_channels, hidden_channels, 1),
+            nn.ReLU(inplace=True),
         )
+        self.out_conv = nn.Conv2d(hidden_channels, out_channels, 3, padding=1)
+        self.class_proj = nn.Linear(class_embed_dim, hidden_channels)
 
-    def forward(self,z,c):
+        nn.init.zeros_(self.out_conv.weight)
+        nn.init.zeros_(self.out_conv.bias)
 
-        x = torch.cat([z,c],dim=1)
+    def forward(self, x: torch.Tensor, c_embed: torch.Tensor) -> torch.Tensor:
+        h = self.net(x)
+        h = h + self.class_proj(c_embed).unsqueeze(-1).unsqueeze(-1)
+        return self.out_conv(h)
 
-        return self.net(x)
 
+class AffineCoupling(nn.Module):
+    """
+    Affine coupling layer.
 
-class Discriminator(nn.Module):
+    Splits channels in half; one half parameterises a scale+shift transform
+    applied to the other half.  log_s is clamped via tanh for stability.
+    """
 
-    def __init__(self):
-
+    def __init__(
+        self, num_channels: int, hidden_channels: int, class_embed_dim: int
+    ):
         super().__init__()
-
-        self.net = nn.Sequential(
-            nn.Linear(125*32*32+10,512),
-            nn.ReLU(),
-            nn.Linear(512,1)
+        assert num_channels % 2 == 0
+        half = num_channels // 2
+        # Output: scale (half) + shift (half)
+        self.nn = CouplingNetwork(
+            half, half * 2, hidden_channels, class_embed_dim
         )
 
-    def forward(self,x,c):
+    def forward(
+        self,
+        x: torch.Tensor,
+        c_embed: torch.Tensor,
+        reverse: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        x_a, x_b = x.chunk(2, dim=1)
 
-        x = x.view(x.size(0),-1)
+        h = self.nn(x_b, c_embed)
+        log_s, t = h.chunk(2, dim=1)
+        log_s = torch.tanh(log_s) * 2.0  # clamp to [-2, 2]
 
-        x = torch.cat([x,c],dim=1)
+        if not reverse:
+            y_a = x_a * torch.exp(log_s) + t
+            log_det = log_s.sum(dim=[1, 2, 3])  # per-sample (B,)
+        else:
+            y_a = (x_a - t) * torch.exp(-log_s)
+            log_det = -log_s.sum(dim=[1, 2, 3])
 
-        return self.net(x)
+        return torch.cat([y_a, x_b], dim=1), log_det
 
 
-# ====================================================
-# 3️⃣ Normalizing Flow (simplified)
-# ====================================================
+class FlowStep(nn.Module):
+    """Single Glow step: ActNorm -> Inv1x1Conv -> AffineCoupling."""
 
-class SimpleFlow(nn.Module):
-
-    def __init__(self):
-
+    def __init__(
+        self, num_channels: int, hidden_channels: int, class_embed_dim: int
+    ):
         super().__init__()
-
-        self.net = nn.Sequential(
-            nn.Linear(125*32*32+10,1024),
-            nn.ReLU(),
-            nn.Linear(1024,125*32*32)
+        self.actnorm = ActNorm(num_channels)
+        self.inv1x1 = Invertible1x1Conv(num_channels)
+        self.coupling = AffineCoupling(
+            num_channels, hidden_channels, class_embed_dim
         )
 
-    def loss(self,x,labels):
+    def forward(
+        self,
+        x: torch.Tensor,
+        c_embed: torch.Tensor,
+        reverse: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        log_det = torch.zeros(x.size(0), device=x.device)
 
-        x = x.to(device)
+        if not reverse:
+            x, ld = self.actnorm(x, reverse=False)
+            log_det = log_det + ld
+            x, ld = self.inv1x1(x, reverse=False)
+            log_det = log_det + ld
+            x, ld = self.coupling(x, c_embed, reverse=False)
+            log_det = log_det + ld
+        else:
+            x, ld = self.coupling(x, c_embed, reverse=True)
+            log_det = log_det + ld
+            x, ld = self.inv1x1(x, reverse=True)
+            log_det = log_det + ld
+            x, ld = self.actnorm(x, reverse=True)
+            log_det = log_det + ld
 
-        c = F.one_hot(labels,10).float().to(device)
-
-        x = x.view(x.size(0),-1)
-
-        inp = torch.cat([x,c],dim=1)
-
-        z = self.net(inp)
-
-        loss = torch.mean(z**2)
-
-        return loss
-
-
-# ====================================================
-# TRAINER
-# ====================================================
-
-def train_model(model,loader,name):
-
-    model = model.to(device)
-
-    optimizer = torch.optim.Adam(model.parameters(),lr=1e-4)
-
-    print("\nTraining",name)
-
-    for epoch in range(1):
-
-        total_loss = 0
-
-        for data,labels in loader:
-
-            optimizer.zero_grad()
-
-            loss = model.loss(data,labels)
-
-            loss.backward()
-
-            optimizer.step()
-
-            total_loss += loss.item()
-
-        print("Loss:",total_loss/len(loader))
+        return x, log_det
 
 
-# ====================================================
-# RUN EXPERIMENTS
-# ====================================================
+# ---------------------------------------------------------------------------
+# Squeeze / unsqueeze
+# ---------------------------------------------------------------------------
 
-vae_model = VAE()
 
-flow_model = SimpleFlow()
+def squeeze(x: torch.Tensor) -> torch.Tensor:
+    """(B, C, H, W) -> (B, 4C, H/2, W/2)."""
+    B, C, H, W = x.shape
+    x = x.view(B, C, H // 2, 2, W // 2, 2)
+    x = x.permute(0, 1, 3, 5, 2, 4).contiguous()
+    return x.view(B, C * 4, H // 2, W // 2)
 
-train_model(vae_model,train_loader,"VAE")
 
-train_model(flow_model,train_loader,"FLOW")
+def unsqueeze(x: torch.Tensor) -> torch.Tensor:
+    """(B, 4C, H/2, W/2) -> (B, C, H, W)."""
+    B, C4, H2, W2 = x.shape
+    C = C4 // 4
+    x = x.view(B, C, 2, 2, H2, W2)
+    x = x.permute(0, 1, 4, 2, 5, 3).contiguous()
+    return x.view(B, C, H2 * 2, W2 * 2)
+
+
+# ---------------------------------------------------------------------------
+# Full model
+# ---------------------------------------------------------------------------
+
+
+class ConditionalGlow(nn.Module):
+    """Multi-scale conditional Glow normalizing flow.
+
+    Args:
+        in_channels: Spectral bands (default 125).
+        num_classes: Disease severity classes (default 10).
+        num_scales: Number of multi-scale levels.
+        num_steps: Flow steps per scale.
+        hidden_channels: Hidden channels in coupling networks.
+        class_embed_dim: Class embedding width.
+        use_grad_checkpoint: Trade compute for memory during training.
+    """
+
+    def __init__(
+        self,
+        in_channels: int = 125,
+        num_classes: int = 10,
+        num_scales: int = 3,
+        num_steps: int = 4,
+        hidden_channels: int = 256,
+        class_embed_dim: int = 64,
+        use_grad_checkpoint: bool = False,
+    ):
+        super().__init__()
+        self.num_scales = num_scales
+        self.use_grad_checkpoint = use_grad_checkpoint
+        self.in_channels = in_channels
+
+        self.class_embed = nn.Embedding(num_classes, class_embed_dim)
+
+        self.flow_scales = nn.ModuleList()
+        C = in_channels
+        for s in range(num_scales):
+            C = C * 4  # squeeze quadruples channels
+            steps = nn.ModuleList(
+                [
+                    FlowStep(C, hidden_channels, class_embed_dim)
+                    for _ in range(num_steps)
+                ]
+            )
+            self.flow_scales.append(steps)
+            if s < num_scales - 1:
+                C = C // 2  # split halves channels
+
+    # -- Forward (encode) --------------------------------------------------
+
+    def forward(
+        self, x: torch.Tensor, labels: torch.Tensor
+    ) -> tuple[list[torch.Tensor], torch.Tensor]:
+        """Encode image to latent z's.
+
+        Args:
+            x: (B, 125, 128, 128) normalised to [0, 1].
+            labels: (B,) integer class labels.
+        Returns:
+            z_list: list of latent tensors, one per scale.
+            total_log_det: (B,) total log|det(dz/dx)|.
+        """
+        c_embed = self.class_embed(labels)
+        z_list: list[torch.Tensor] = []
+        total_log_det = torch.zeros(x.size(0), device=x.device)
+
+        h = x
+        for s, steps in enumerate(self.flow_scales):
+            h = squeeze(h)
+            for step in steps:
+                if self.use_grad_checkpoint and self.training:
+                    h, ld = grad_checkpoint(
+                        step, h, c_embed, False, use_reentrant=False
+                    )
+                else:
+                    h, ld = step(h, c_embed, reverse=False)
+                total_log_det = total_log_det + ld
+
+            if s < self.num_scales - 1:
+                z, h = h.chunk(2, dim=1)
+                z_list.append(z)
+            else:
+                z_list.append(h)
+
+        return z_list, total_log_det
+
+    # -- Reverse (decode / generate) ---------------------------------------
+
+    @torch.no_grad()
+    def reverse(
+        self, z_list: list[torch.Tensor], labels: torch.Tensor
+    ) -> torch.Tensor:
+        """Decode latent z's back to image space.
+
+        Args:
+            z_list: list of latent tensors (one per scale).
+            labels: (B,) integer class labels.
+        Returns:
+            x: (B, 125, 128, 128) in [0, 1].
+        """
+        c_embed = self.class_embed(labels)
+        h = z_list[-1]
+
+        for s in reversed(range(self.num_scales)):
+            if s < self.num_scales - 1:
+                h = torch.cat([z_list[s], h], dim=1)
+            for step in reversed(self.flow_scales[s]):
+                h, _ = step(h, c_embed, reverse=True)
+            h = unsqueeze(h)
+
+        return h
+
+    @torch.no_grad()
+    def generate(
+        self,
+        labels: torch.Tensor,
+        temperature: float = 0.7,
+        device: torch.device | None = None,
+    ) -> torch.Tensor:
+        """Sample images by drawing z ~ N(0, T^2 I) and running reverse.
+
+        Args:
+            labels: (N,) integer class labels.
+            temperature: Sampling temperature (lower = sharper but less diverse).
+            device: Target device (inferred from model if None).
+        Returns:
+            images: (N, 125, 128, 128) clamped to [0, 1].
+        """
+        if device is None:
+            device = next(self.parameters()).device
+        labels = labels.to(device)
+
+        z_list: list[torch.Tensor] = []
+        C = self.in_channels
+        H, W = 128, 128
+
+        for s in range(self.num_scales):
+            C, H, W = C * 4, H // 2, W // 2
+            if s < self.num_scales - 1:
+                z_list.append(
+                    torch.randn(labels.size(0), C // 2, H, W, device=device)
+                    * temperature
+                )
+                C = C // 2
+            else:
+                z_list.append(
+                    torch.randn(labels.size(0), C, H, W, device=device)
+                    * temperature
+                )
+
+        return torch.clamp(self.reverse(z_list, labels), 0.0, 1.0)
+
+
+# ---------------------------------------------------------------------------
+# Loss
+# ---------------------------------------------------------------------------
+
+
+def glow_nll_loss(
+    z_list: list[torch.Tensor], log_det: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Negative log-likelihood loss under a standard normal prior.
+
+    NLL = 0.5 * sum(z^2) - log_det, averaged per dimension.
+
+    Returns:
+        nll: mean NLL in nats-per-dimension.
+        prior_nll: mean 0.5*||z||^2 / D.
+        log_det_per_dim: mean log_det / D.
+    """
+    total_dims = sum(z.shape[1] * z.shape[2] * z.shape[3] for z in z_list)
+
+    prior = sum(0.5 * (z**2).sum(dim=[1, 2, 3]) for z in z_list)  # (B,)
+    nll = (prior - log_det) / total_dims  # (B,) nats/dim
+
+    return (
+        nll.mean(),
+        prior.mean() / total_dims,
+        log_det.mean() / total_dims,
+    )
