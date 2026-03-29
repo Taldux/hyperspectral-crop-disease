@@ -13,8 +13,6 @@ from pathlib import Path
 
 import torch
 from torch import nn, optim
-from torch.amp.autocast_mode import autocast
-from torch.amp.grad_scaler import GradScaler
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
@@ -97,7 +95,6 @@ def train_one_epoch(
     loader: DataLoader,
     optimizer: optim.Optimizer,
     device: torch.device,
-    scaler: GradScaler | None,
 ) -> tuple[float, float, float]:
     """Returns: mean_nll, mean_prior, mean_logdet (all nats/dim)."""
     model.train()
@@ -105,6 +102,7 @@ def train_one_epoch(
     total_prior = 0.0
     total_logdet = 0.0
     n_batches = 0
+    nan_batches = 0
 
     for inputs, labels in tqdm(loader, desc="  train", leave=False):
         inputs = inputs.to(device, non_blocking=True)
@@ -112,26 +110,24 @@ def train_one_epoch(
 
         optimizer.zero_grad(set_to_none=True)
 
-        if scaler is not None:
-            with autocast("cuda"):
-                z_list, log_det = model(inputs, labels)
-                nll, prior_nll, logdet_per_dim = glow_nll_loss(z_list, log_det)
-            scaler.scale(nll).backward()
-            scaler.unscale_(optimizer)
-            nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
-            scaler.step(optimizer)
-            scaler.update()
-        else:
-            z_list, log_det = model(inputs, labels)
-            nll, prior_nll, logdet_per_dim = glow_nll_loss(z_list, log_det)
-            nll.backward()
-            nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
-            optimizer.step()
+        z_list, log_det = model(inputs, labels)
+        nll, prior_nll, logdet_per_dim = glow_nll_loss(z_list, log_det)
+
+        if torch.isnan(nll) or torch.isinf(nll):
+            nan_batches += 1
+            continue  # skip this batch, don't update weights
+
+        nll.backward()
+        nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
+        optimizer.step()
 
         total_nll += nll.item()
         total_prior += prior_nll.item()
         total_logdet += logdet_per_dim.item()
         n_batches += 1
+
+    if nan_batches > 0:
+        print(f"  ⚠ skipped {nan_batches} NaN batches")
 
     return total_nll / n_batches, total_prior / n_batches, total_logdet / n_batches
 
@@ -240,7 +236,8 @@ def main():
         optimizer, [warmup, cosine], milestones=[args.warmup_epochs]
     )
 
-    scaler = GradScaler("cuda") if device.type == "cuda" else None
+    # NOTE: AMP (float16) is intentionally disabled for normalizing flows.
+    # The chained exp/log operations in ActNorm + InvertibleConv overflow in fp16.
 
     # Resume
     start_epoch = 0
@@ -256,7 +253,7 @@ def main():
         t0 = time.time()
 
         train_nll, train_prior, train_logdet = train_one_epoch(
-            model, train_loader, optimizer, device, scaler
+            model, train_loader, optimizer, device
         )
         val_nll, val_prior, val_logdet = evaluate(model, val_loader, device)
         scheduler.step()
