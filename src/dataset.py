@@ -6,6 +6,7 @@ The dataset normalizes to [0, 1] float32 using precomputed global min/max stats
 and returns tensors in (C, H, W) format for PyTorch convolutions.
 """
 
+import re
 import numpy as np
 import torch
 from torch.utils.data import Dataset
@@ -18,10 +19,12 @@ class HyperspectralDataset(Dataset):
     Args:
         split_file: Path to a .txt file with lines of "filepath\\tlabel".
         stats_file: Path to stats.npz containing global_min and global_max.
+        data_root: Optional root directory. Paths in the split file that contain
+            'data/Train' or 'data/evaluation' will be re-rooted here.
         transform: Optional callable applied to the tensor after normalization.
     """
 
-    def __init__(self, split_file: str, stats_file: str, transform=None):
+    def __init__(self, split_file: str, stats_file: str, data_root: str | None = None, transform=None):
         self.files: list[str] = []
         self.labels: list[int] = []
         self.transform = transform
@@ -39,8 +42,21 @@ class HyperspectralDataset(Dataset):
                 if not line:
                     continue
                 filepath, label = line.split("\t")
+                filepath = self._resolve_path(filepath, data_root)
                 self.files.append(filepath)
                 self.labels.append(int(label))
+
+    @staticmethod
+    def _resolve_path(filepath: str, data_root: str | None) -> str:
+        """Re-root absolute paths so split files work across machines/OS."""
+        if data_root is None:
+            return filepath
+        # Extract the relative portion starting from 'data/'
+        m = re.search(r'[/\\](data[/\\].+)$', filepath)
+        if m:
+            rel = m.group(1).replace('\\', '/')
+            return str(Path(data_root) / rel)
+        return filepath
 
     def __len__(self) -> int:
         return len(self.files)

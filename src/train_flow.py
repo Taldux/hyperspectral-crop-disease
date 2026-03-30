@@ -24,11 +24,13 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Train conditional Glow flow")
     p.add_argument("--data-dir", type=str, default="data/processed",
                    help="Directory containing split files and stats.npz")
+    p.add_argument("--data-root", type=str, default=None,
+                   help="Re-root .npy paths in split files to this directory")
     p.add_argument("--out-dir", type=str, default="results/flow",
                    help="Directory for checkpoints and logs")
     p.add_argument("--epochs", type=int, default=200)
     p.add_argument("--batch-size", type=int, default=2)
-    p.add_argument("--lr", type=float, default=1e-4)
+    p.add_argument("--lr", type=float, default=5e-5)
     p.add_argument("--weight-decay", type=float, default=0.0)
     p.add_argument("--warmup-epochs", type=int, default=5,
                    help="Linear LR warmup epochs")
@@ -113,21 +115,23 @@ def train_one_epoch(
         z_list, log_det = model(inputs, labels)
         nll, prior_nll, logdet_per_dim = glow_nll_loss(z_list, log_det)
 
-        if torch.isnan(nll) or torch.isinf(nll):
+        # Skip batches with NaN/Inf or exploding loss
+        nll_val = nll.item()
+        if torch.isnan(nll) or torch.isinf(nll) or nll_val > 100.0:
             nan_batches += 1
             continue  # skip this batch, don't update weights
 
         nll.backward()
-        nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
+        nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
 
-        total_nll += nll.item()
+        total_nll += nll_val
         total_prior += prior_nll.item()
         total_logdet += logdet_per_dim.item()
         n_batches += 1
 
     if nan_batches > 0:
-        print(f"  ⚠ skipped {nan_batches} NaN batches")
+        print(f"  ⚠ skipped {nan_batches} bad batches (NaN/Inf/exploding)")
 
     return total_nll / n_batches, total_prior / n_batches, total_logdet / n_batches
 
@@ -199,10 +203,12 @@ def main():
     train_ds = HyperspectralDataset(
         split_file=str(data_dir / "train.txt"),
         stats_file=str(data_dir / "stats.npz"),
+        data_root=args.data_root,
     )
     val_ds = HyperspectralDataset(
         split_file=str(data_dir / "val.txt"),
         stats_file=str(data_dir / "stats.npz"),
+        data_root=args.data_root,
     )
     print(f"Train: {len(train_ds)}, Val: {len(val_ds)}")
 
