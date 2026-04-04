@@ -30,10 +30,10 @@ def parse_args() -> argparse.Namespace:
                    help="Re-root paths in eval.txt to this directory")
     p.add_argument("--out-dir", type=str, default="results/eval",
                    help="Directory to save generated images and CSV")
-    p.add_argument("--num-per-class", type=int, default=100)
+    p.add_argument("--num-per-class", type=int, default=50)
     p.add_argument("--num-classes", type=int, default=10)
     p.add_argument("--temperature", type=float, default=None,
-                   help="Sampling temperature (if unset, sweeps [0.4..0.9])")
+                   help="Sampling temperature (if unset, sweeps [0.9..1.2])")
     p.add_argument("--batch-size", type=int, default=10,
                    help="Batch size for generation")
     # Architecture (must match training)
@@ -75,24 +75,45 @@ def load_real_images(eval_file: str, stats_file: str, data_root: str | None
     return real
 
 
-def extract_features(images: list[np.ndarray], spatial_size: int = 16) -> np.ndarray:
-    """Extract features from (H,W,C) images for FID computation.
+def extract_spectral_features(images: list[np.ndarray]) -> np.ndarray:
+    """Rich spectral features: mean, std, percentiles, inter-band correlation.
 
-    Downsamples each image to (spatial_size, spatial_size, C), then flattens.
-    This preserves spatial structure while keeping dimensionality tractable
-    for covariance estimation with ~100 samples.
-
-    A 16x16x125 = 32000-dim representation is a good middle ground between
-    full resolution (2M dims, OOM) and channel-only stats (250 dims, no spatial info).
+    Returns a 624-dim feature vector per image:
+    - mean per band (125)
+    - std per band (125)
+    - 25th percentile per band (125)
+    - 75th percentile per band (125)
+    - adjacent-band correlations (124)
     """
+    features = []
+    for img in images:
+        if img.shape[0] < img.shape[-1]:
+            pixels = img.reshape(-1, img.shape[-1])  # (H*W, C)
+        else:
+            pixels = img.reshape(img.shape[0], -1).T  # (H*W, C)
+        ch_mean = pixels.mean(axis=0)
+        ch_std = pixels.std(axis=0)
+        ch_p25 = np.percentile(pixels, 25, axis=0)
+        ch_p75 = np.percentile(pixels, 75, axis=0)
+        corr = np.array([
+            np.corrcoef(pixels[:, i], pixels[:, i + 1])[0, 1]
+            for i in range(pixels.shape[1] - 1)
+        ])
+        corr = np.nan_to_num(corr, nan=0.0)
+        feat = np.concatenate([ch_mean, ch_std, ch_p25, ch_p75, corr])
+        features.append(feat)
+    return np.array(features)
+
+
+def extract_spatial_features(images: list[np.ndarray], spatial_size: int = 32) -> np.ndarray:
+    """Downsample to (spatial_size, spatial_size, C) and flatten."""
     from scipy.ndimage import zoom
 
     features = []
     for img in images:
-        img64 = img.astype(np.float64)
-        h, w = img64.shape[:2]
-        factors = (spatial_size / h, spatial_size / w, 1.0)  # keep channels
-        img_small = zoom(img64, factors, order=1)
+        h, w = img.shape[:2]
+        factors = (spatial_size / h, spatial_size / w, 1.0)
+        img_small = zoom(img.astype(np.float64), factors, order=1)
         features.append(img_small.ravel())
     return np.array(features)
 
@@ -175,22 +196,26 @@ def main():
     if args.temperature is not None:
         temperatures = [args.temperature]
     else:
-        temperatures = [0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
+        temperatures = [0.9, 0.95, 1.0, 1.05, 1.1, 1.15, 1.2]
         print(f"Temperature sweep: {temperatures}")
 
-    # Pre-extract real features (spectral mean + std)
-    real_features_by_class: dict[int, np.ndarray] = {}
+    # Pre-extract real features (both spectral and spatial)
+    real_spectral_by_class: dict[int, np.ndarray] = {}
+    real_spatial_by_class: dict[int, np.ndarray] = {}
     for cls, imgs in real_by_class.items():
-        real_features_by_class[cls] = extract_features(imgs)
+        real_spectral_by_class[cls] = extract_spectral_features(imgs)
+        real_spatial_by_class[cls] = extract_spatial_features(imgs)
 
     # Generate and evaluate per class (with temperature sweep)
-    fid_scores: dict[int, float] = {}
+    fid_spectral: dict[int, float] = {}
+    fid_spatial: dict[int, float] = {}
     best_temps: dict[int, float] = {}
 
     for cls in range(args.num_classes):
         print(f"\nClass {cls}:")
-        real_feats = real_features_by_class.get(cls)
-        if real_feats is None:
+        rf_spec = real_spectral_by_class.get(cls)
+        rf_spat = real_spatial_by_class.get(cls)
+        if rf_spec is None:
             print(f"  WARNING: no real images for class {cls}, skipping")
             continue
 
@@ -212,20 +237,25 @@ def main():
                     generated.append(imgs_01[i])
                 remaining -= bs
 
-            fake_feats = extract_features(generated)
-            fid = compute_fid(real_feats, fake_feats)
+            ff_spec = extract_spectral_features(generated)
+            fid_s = compute_fid(rf_spec, ff_spec)
 
             if len(temperatures) > 1:
-                print(f"  temp={temp:.1f} -> FID={fid:.2f}")
+                print(f"  temp={temp:.2f} -> Spectral FID={fid_s:.2f}")
 
-            if fid < best_fid:
-                best_fid = fid
+            if fid_s < best_fid:
+                best_fid = fid_s
                 best_temp = temp
                 best_generated = generated
 
-        fid_scores[cls] = best_fid
+        # Compute spatial FID for the best-temperature samples
+        ff_spat = extract_spatial_features(best_generated)
+        spatial_score = compute_fid(rf_spat, ff_spat)
+
+        fid_spectral[cls] = best_fid
+        fid_spatial[cls] = spatial_score
         best_temps[cls] = best_temp
-        print(f"  Best: temp={best_temp:.1f}, FID={best_fid:.2f}")
+        print(f"  Best: temp={best_temp:.2f}, Spectral FID={best_fid:.2f}, Spatial FID={spatial_score:.2f}")
 
         # Save best generated images (denormalized uint16)
         gen_dir = out_dir / f"generated/{cls}"
@@ -236,23 +266,31 @@ def main():
             np.save(gen_dir / f"{idx:03d}.npy", img_raw)
 
     # Summary
-    print("\n" + "=" * 50)
+    print("\n" + "=" * 60)
     print("Per-class FID scores:")
+    print(f"{'Class':<8} {'Spectral FID':<15} {'Spatial FID':<15} {'Temp':<6}")
+    print("-" * 44)
     for cls in range(args.num_classes):
-        score = fid_scores.get(cls, float("nan"))
+        spec = fid_spectral.get(cls, float("nan"))
+        spat = fid_spatial.get(cls, float("nan"))
         temp = best_temps.get(cls, float("nan"))
-        print(f"  Class {cls}: FID={score:.2f} (temp={temp:.1f})")
-    mean_fid = np.mean(list(fid_scores.values()))
-    print(f"  Mean FID: {mean_fid:.2f}")
+        print(f"{cls:<8} {spec:<15.2f} {spat:<15.2f} {temp:<6.2f}")
+    mean_spec = np.mean(list(fid_spectral.values()))
+    mean_spat = np.mean(list(fid_spatial.values()))
+    print("-" * 44)
+    print(f"{'Mean':<8} {mean_spec:<15.2f} {mean_spat:<15.2f}")
+    print(f"\nSpectral FID: rich spectral features (mean/std/percentiles/correlation, 624-dim)")
+    print(f"Spatial FID: 32x32 downsample + PCA")
 
     # Save CSV
     csv_path = out_dir / "submission.csv"
     with open(csv_path, "w") as f:
-        f.write("class,fid,temperature\n")
+        f.write("class,spectral_fid,spatial_fid,temperature\n")
         for cls in range(args.num_classes):
-            score = fid_scores.get(cls, float("nan"))
+            spec = fid_spectral.get(cls, float("nan"))
+            spat = fid_spatial.get(cls, float("nan"))
             temp = best_temps.get(cls, float("nan"))
-            f.write(f"{cls},{score:.4f},{temp:.1f}\n")
+            f.write(f"{cls},{spec:.4f},{spat:.4f},{temp:.2f}\n")
     print(f"\nSaved submission to {csv_path}")
 
 
