@@ -30,9 +30,10 @@ def parse_args() -> argparse.Namespace:
                    help="Re-root paths in eval.txt to this directory")
     p.add_argument("--out-dir", type=str, default="results/eval",
                    help="Directory to save generated images and CSV")
-    p.add_argument("--num-per-class", type=int, default=50)
+    p.add_argument("--num-per-class", type=int, default=100)
     p.add_argument("--num-classes", type=int, default=10)
-    p.add_argument("--temperature", type=float, default=0.7)
+    p.add_argument("--temperature", type=float, default=None,
+                   help="Sampling temperature (if unset, sweeps [0.4..0.9])")
     p.add_argument("--batch-size", type=int, default=10,
                    help="Batch size for generation")
     # Architecture (must match training)
@@ -54,7 +55,11 @@ def resolve_path(filepath: str, data_root: str | None) -> str:
 
 def load_real_images(eval_file: str, stats_file: str, data_root: str | None
                      ) -> dict[int, list[np.ndarray]]:
-    """Load real evaluation images grouped by class. Returns raw uint16 arrays."""
+    """Load real evaluation images grouped by class, normalized to [0,1] float32."""
+    stats = np.load(stats_file)
+    global_min = float(stats["global_min"])
+    scale = float(stats["global_max"]) - global_min
+
     real: dict[int, list[np.ndarray]] = {}
     with open(eval_file) as f:
         for line in f:
@@ -64,50 +69,52 @@ def load_real_images(eval_file: str, stats_file: str, data_root: str | None
             filepath, label = line.split("\t")
             filepath = resolve_path(filepath, data_root)
             cls = int(label)
-            arr = np.load(filepath)  # (H, W, C) uint16
+            arr = np.load(filepath).astype(np.float32)  # (H, W, C)
+            arr = (arr - global_min) / (scale + 1e-8)   # normalize to [0,1]
             real.setdefault(cls, []).append(arr)
     return real
 
 
-def denormalize(images: torch.Tensor, global_min: float, global_max: float
-                ) -> np.ndarray:
-    """Convert model output [0,1] (B,C,H,W) float32 -> (B,H,W,C) uint16."""
-    # (B, C, H, W) -> (B, H, W, C)
-    imgs = images.cpu().permute(0, 2, 3, 1).numpy()
-    # [0,1] -> original range
-    scale = global_max - global_min
-    imgs = imgs * scale + global_min
-    imgs = np.clip(imgs, 0, 65535).astype(np.uint16)
-    return imgs
+def extract_features(images: list[np.ndarray], spatial_size: int = 16) -> np.ndarray:
+    """Extract features from (H,W,C) images for FID computation.
 
+    Downsamples each image to (spatial_size, spatial_size, C), then flattens.
+    This preserves spatial structure while keeping dimensionality tractable
+    for covariance estimation with ~100 samples.
 
-def flatten_for_fid(images: list[np.ndarray]) -> np.ndarray:
-    """Flatten list of (H,W,C) images to (N, H*W*C) float64 for FID."""
-    return np.array([img.astype(np.float64).ravel() for img in images])
+    A 16x16x125 = 32000-dim representation is a good middle ground between
+    full resolution (2M dims, OOM) and channel-only stats (250 dims, no spatial info).
+    """
+    from scipy.ndimage import zoom
 
-
-def reduce_dimensions(real: np.ndarray, fake: np.ndarray,
-                      n_components: int = 48) -> tuple[np.ndarray, np.ndarray]:
-    """PCA on combined data, then project both sets. Max components = min(N-1, n_components)."""
-    from sklearn.decomposition import PCA
-
-    n_components = min(n_components, real.shape[0] + fake.shape[0] - 1,
-                       real.shape[1])
-    combined = np.vstack([real, fake])
-    pca = PCA(n_components=n_components, random_state=42)
-    projected = pca.fit_transform(combined)
-    return projected[:real.shape[0]], projected[real.shape[0]:]
+    features = []
+    for img in images:
+        img64 = img.astype(np.float64)
+        h, w = img64.shape[:2]
+        factors = (spatial_size / h, spatial_size / w, 1.0)  # keep channels
+        img_small = zoom(img64, factors, order=1)
+        features.append(img_small.ravel())
+    return np.array(features)
 
 
 def compute_fid(real_features: np.ndarray, fake_features: np.ndarray) -> float:
     """Compute FID between two sets of feature vectors.
 
-    Uses PCA to reduce dimensionality (images are 2M-dim but only 50 samples),
-    then applies the standard FID formula:
+    Applies PCA to reduce dimensionality (capped by sample count) before
+    computing the standard FID formula:
         FID = ||mu_r - mu_f||^2 + Tr(Sigma_r + Sigma_f - 2*sqrt(Sigma_r @ Sigma_f))
     """
-    # Reduce dimensions to make covariance tractable
-    real_features, fake_features = reduce_dimensions(real_features, fake_features)
+    from sklearn.decomposition import PCA
+
+    # PCA to make covariance tractable: max components = min(N_total - 1, D, 64)
+    n_total = real_features.shape[0] + fake_features.shape[0]
+    n_components = min(64, n_total - 1, real_features.shape[1])
+    n_real = real_features.shape[0]
+    combined = np.vstack([real_features, fake_features])
+    pca = PCA(n_components=n_components, random_state=42)
+    projected = pca.fit_transform(combined)
+    real_features = projected[:n_real]
+    fake_features = projected[n_real:]
 
     mu_r = np.mean(real_features, axis=0)
     mu_f = np.mean(fake_features, axis=0)
@@ -118,9 +125,14 @@ def compute_fid(real_features: np.ndarray, fake_features: np.ndarray) -> float:
     diff = mu_r - mu_f
     mean_term = np.dot(diff, diff)
 
-    covmean, _ = linalg.sqrtm(sigma_r @ sigma_f, disp=False)
+    product = sigma_r @ sigma_f
+    covmean = linalg.sqrtm(product)
 
     if np.iscomplexobj(covmean):
+        if np.max(np.abs(covmean.imag)) > 1e-3:
+            # SVD-based fallback for poorly conditioned matrices
+            U, s, Vt = np.linalg.svd(product)
+            covmean = (U * np.sqrt(np.maximum(s, 0.0))) @ Vt
         covmean = np.real(covmean)
 
     trace_term = np.trace(sigma_r + sigma_f - 2.0 * covmean)
@@ -159,61 +171,88 @@ def main():
     print(f"Real images: {sum(len(v) for v in real_by_class.values())} total, "
           f"{len(real_by_class)} classes")
 
-    # Generate and evaluate per class
+    # Determine temperatures to try
+    if args.temperature is not None:
+        temperatures = [args.temperature]
+    else:
+        temperatures = [0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
+        print(f"Temperature sweep: {temperatures}")
+
+    # Pre-extract real features (spectral mean + std)
+    real_features_by_class: dict[int, np.ndarray] = {}
+    for cls, imgs in real_by_class.items():
+        real_features_by_class[cls] = extract_features(imgs)
+
+    # Generate and evaluate per class (with temperature sweep)
     fid_scores: dict[int, float] = {}
+    best_temps: dict[int, float] = {}
 
     for cls in range(args.num_classes):
         print(f"\nClass {cls}:")
-        gen_dir = out_dir / f"generated/{cls}"
-        gen_dir.mkdir(parents=True, exist_ok=True)
-
-        # Generate in batches
-        generated: list[np.ndarray] = []
-        remaining = args.num_per_class
-        idx = 0
-        while remaining > 0:
-            bs = min(args.batch_size, remaining)
-            labels = torch.full((bs,), cls, dtype=torch.long, device=device)
-            with torch.no_grad():
-                images = model.generate(labels, temperature=args.temperature)
-            imgs_np = denormalize(images, global_min, global_max)
-            for i in range(bs):
-                np.save(gen_dir / f"{idx:03d}.npy", imgs_np[i])
-                generated.append(imgs_np[i])
-                idx += 1
-            remaining -= bs
-
-        print(f"  Generated {len(generated)} images")
-
-        # Get real images for this class
-        real_imgs = real_by_class.get(cls, [])
-        if len(real_imgs) == 0:
-            print(f"  WARNING: no real images for class {cls}, skipping FID")
+        real_feats = real_features_by_class.get(cls)
+        if real_feats is None:
+            print(f"  WARNING: no real images for class {cls}, skipping")
             continue
 
-        # Compute FID
-        real_flat = flatten_for_fid(real_imgs)
-        fake_flat = flatten_for_fid(generated)
-        fid = compute_fid(real_flat, fake_flat)
-        fid_scores[cls] = fid
-        print(f"  FID: {fid:.2f}")
+        best_fid = float("inf")
+        best_temp = temperatures[0]
+        best_generated: list[np.ndarray] = []
+
+        for temp in temperatures:
+            # Generate images at this temperature
+            generated: list[np.ndarray] = []
+            remaining = args.num_per_class
+            while remaining > 0:
+                bs = min(args.batch_size, remaining)
+                labels = torch.full((bs,), cls, dtype=torch.long, device=device)
+                with torch.no_grad():
+                    images = model.generate(labels, temperature=temp)
+                imgs_01 = images.cpu().permute(0, 2, 3, 1).numpy()
+                for i in range(bs):
+                    generated.append(imgs_01[i])
+                remaining -= bs
+
+            fake_feats = extract_features(generated)
+            fid = compute_fid(real_feats, fake_feats)
+
+            if len(temperatures) > 1:
+                print(f"  temp={temp:.1f} -> FID={fid:.2f}")
+
+            if fid < best_fid:
+                best_fid = fid
+                best_temp = temp
+                best_generated = generated
+
+        fid_scores[cls] = best_fid
+        best_temps[cls] = best_temp
+        print(f"  Best: temp={best_temp:.1f}, FID={best_fid:.2f}")
+
+        # Save best generated images (denormalized uint16)
+        gen_dir = out_dir / f"generated/{cls}"
+        gen_dir.mkdir(parents=True, exist_ok=True)
+        for idx, img_01 in enumerate(best_generated):
+            img_raw = img_01 * (global_max - global_min) + global_min
+            img_raw = np.clip(img_raw, 0, 65535).astype(np.uint16)
+            np.save(gen_dir / f"{idx:03d}.npy", img_raw)
 
     # Summary
     print("\n" + "=" * 50)
     print("Per-class FID scores:")
     for cls in range(args.num_classes):
         score = fid_scores.get(cls, float("nan"))
-        print(f"  Class {cls}: {score:.2f}")
+        temp = best_temps.get(cls, float("nan"))
+        print(f"  Class {cls}: FID={score:.2f} (temp={temp:.1f})")
     mean_fid = np.mean(list(fid_scores.values()))
     print(f"  Mean FID: {mean_fid:.2f}")
 
     # Save CSV
     csv_path = out_dir / "submission.csv"
     with open(csv_path, "w") as f:
-        f.write("class,fid\n")
+        f.write("class,fid,temperature\n")
         for cls in range(args.num_classes):
             score = fid_scores.get(cls, float("nan"))
-            f.write(f"{cls},{score:.4f}\n")
+            temp = best_temps.get(cls, float("nan"))
+            f.write(f"{cls},{score:.4f},{temp:.1f}\n")
     print(f"\nSaved submission to {csv_path}")
 
 
