@@ -1,8 +1,11 @@
 """
 Generate synthetic hyperspectral images and compute per-class FID.
 
+Uses InceptionV3 pool3 features on SRF-projected RGB images —
+the same metric used in the Kaggle competition evaluation.
+
 Usage:
-    python -m src.evaluate --checkpoint best.pt
+    python -m src.evaluate --checkpoint results/flow/epoch_125.pt
     python -m src.evaluate --checkpoint best.pt --out-dir results/eval
     python -m src.evaluate --checkpoint best.pt --data-root /kaggle/working
 """
@@ -13,9 +16,127 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 from scipy import linalg
+from torchvision import transforms
+from torchvision.models import Inception_V3_Weights, inception_v3
 
 from src.models.flow import ConditionalGlow
+
+# ---------------------------------------------------------------------------
+# Spectral Response Functions (Sentinel-2 green / red / NIR approximation)
+# Resampled from the competition's SRF table to 125 hyperspectral bands.
+# ---------------------------------------------------------------------------
+_SRF_GREEN = torch.tensor([
+    0.0000, 0.0000, 0.0000, 0.0000, 0.0001, 0.0002, 0.0005, 0.0008, 0.0014, 0.0024, 0.0041,
+    0.0069, 0.0113, 0.0180, 0.0279, 0.0414, 0.0583, 0.0783, 0.1008, 0.1252, 0.1507, 0.1766,
+    0.2023, 0.2271, 0.2505, 0.2721, 0.2913, 0.3079, 0.3216, 0.3324, 0.3404, 0.3459, 0.3495,
+    0.3516, 0.3528, 0.3533, 0.3535, 0.3536, 0.3538, 0.3539, 0.3541, 0.3542, 0.3542, 0.3541,
+    0.3535, 0.3520, 0.3491, 0.3443, 0.3373, 0.3277, 0.3152, 0.2997, 0.2811, 0.2595, 0.2349,
+    0.2076, 0.1778, 0.1462, 0.1140, 0.0823, 0.0524, 0.0259, 0.0037, 0.0003, 0.0000, 0.0000,
+    0.0000, 0.0000, 0.0000, 0.0000, 0.0000, 0.0000, 0.0000, 0.0000, 0.0000, 0.0000,
+]).float()
+
+_SRF_RED = torch.tensor([
+    0.0000, 0.0000, 0.0000, 0.0000, 0.0001, 0.0002, 0.0003, 0.0006, 0.0012, 0.0024, 0.0047,
+    0.0087, 0.0154, 0.0255, 0.0395, 0.0575, 0.0786, 0.1020, 0.1265, 0.1505, 0.1732, 0.1940,
+    0.2121, 0.2269, 0.2381, 0.2454, 0.2491, 0.2494, 0.2466, 0.2409, 0.2326, 0.2219, 0.2093,
+    0.1952, 0.1799, 0.1639, 0.1476, 0.1314, 0.1157, 0.1008, 0.0870, 0.0744, 0.0629, 0.0525,
+    0.0430, 0.0344, 0.0266, 0.0195, 0.0129, 0.0070, 0.0018, 0.0003, 0.0000, 0.0000, 0.0000,
+    0.0000, 0.0000, 0.0000, 0.0000, 0.0000, 0.0000, 0.0000, 0.0000, 0.0000, 0.0000,
+]).float()
+
+_SRF_NIR = torch.tensor([
+    0.0000, 0.0000, 0.0000, 0.0000, 0.0000, 0.0001, 0.0002, 0.0003, 0.0006, 0.0011, 0.0022,
+    0.0041, 0.0073, 0.0125, 0.0204, 0.0317, 0.0470, 0.0666, 0.0905, 0.1185, 0.1500, 0.1841,
+    0.2196, 0.2554, 0.2900, 0.3219, 0.3495, 0.3715, 0.3870, 0.3950, 0.3950, 0.3872, 0.3721,
+    0.3503, 0.3228, 0.2912, 0.2573, 0.2228, 0.1888, 0.1563, 0.1261, 0.0990, 0.0755, 0.0557,
+    0.0395, 0.0265, 0.0162, 0.0082, 0.0023, 0.0003, 0.0000, 0.0000, 0.0000, 0.0000, 0.0000,
+    0.0000, 0.0000, 0.0000, 0.0000, 0.0000, 0.0000, 0.0000, 0.0000, 0.0000, 0.0000,
+]).float()
+
+_WAVELENGTHS = torch.linspace(450.0, 950.0, 125)
+
+
+def _resample_srf(srf_1d: torch.Tensor, wl_axis: torch.Tensor) -> torch.Tensor:
+    """Interpolate an SRF defined on its own grid to the hyperspectral band axis."""
+    n = srf_1d.numel()
+    xp = np.linspace(450.0, 950.0, n)
+    values = np.interp(wl_axis.cpu().numpy(), xp, srf_1d.cpu().numpy())
+    out = torch.from_numpy(values).float()
+    return out / out.sum()
+
+
+_SRF_RESAMPLED = {
+    "green": _resample_srf(_SRF_GREEN, _WAVELENGTHS),
+    "red":   _resample_srf(_SRF_RED,   _WAVELENGTHS),
+    "nir":   _resample_srf(_SRF_NIR,   _WAVELENGTHS),
+}
+
+
+def hs_to_s2_rgb(hs_img: torch.Tensor) -> torch.Tensor:
+    """Project a (125, H, W) hyperspectral image to (3, H, W) Sentinel-2 RGB."""
+    if hs_img.shape[0] != 125:
+        raise ValueError(f"Expected 125 spectral bands, got {hs_img.shape[0]}")
+    out = []
+    for key in ("green", "red", "nir"):
+        w = _SRF_RESAMPLED[key].view(125, 1, 1).to(hs_img.device)
+        out.append((hs_img * w).sum(0))
+    return torch.stack(out)  # (3, H, W)
+
+
+# ---------------------------------------------------------------------------
+# InceptionV3 feature extractor (pool3, 2048-d)
+# ---------------------------------------------------------------------------
+
+class InceptionPool3(nn.Module):
+    """InceptionV3 trimmed to pool3 output (2048-d). Frozen, eval-only."""
+
+    def __init__(self, device: torch.device):
+        super().__init__()
+        weights = Inception_V3_Weights.IMAGENET1K_V1
+        net = inception_v3(weights=weights, aux_logits=True, transform_input=False).to(device)
+        net.eval()
+        net.AuxLogits = nn.Identity()
+        self.stem_and_blocks = nn.Sequential(*list(net.children())[:-2])
+        self.avgpool = net.avgpool
+        self.norm = transforms.Normalize(
+            mean=[0.485, 0.456, 0.406],
+            std=[0.229, 0.224, 0.225],
+        )
+
+    @torch.no_grad()
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.norm(x)
+        x = self.stem_and_blocks(x)
+        x = self.avgpool(x)
+        return torch.flatten(x, 1)
+
+
+@torch.no_grad()
+def get_activations(
+    images: list[np.ndarray],
+    model: InceptionPool3,
+    device: torch.device,
+    batch_size: int = 8,
+) -> np.ndarray:
+    """Extract InceptionV3 pool3 features from a list of (H, W, 125) float32 images.
+
+    Returns (N, 2048) array.
+    """
+    feats = []
+    for i in range(0, len(images), batch_size):
+        batch = images[i: i + batch_size]
+        # (H, W, C) → (C, H, W) for each image, then stack to (N, 125, H, W)
+        hs = torch.stack([
+            torch.from_numpy(img.transpose(2, 0, 1))
+            for img in batch
+        ]).to(device)
+        rgb = torch.stack([hs_to_s2_rgb(img) for img in hs])  # (N, 3, H, W)
+        rgb = F.interpolate(rgb, size=(299, 299), mode="bilinear", align_corners=False)
+        feats.append(model(rgb).cpu().numpy())
+    return np.concatenate(feats, axis=0)
 
 
 def parse_args() -> argparse.Namespace:
@@ -30,11 +151,12 @@ def parse_args() -> argparse.Namespace:
                    help="Re-root paths in eval.txt to this directory")
     p.add_argument("--out-dir", type=str, default="results/eval",
                    help="Directory to save generated images and CSV")
-    p.add_argument("--num-per-class", type=int, default=50)
+    p.add_argument("--num-per-class", type=int, default=50,
+                   help="Generated images per class (≥200 recommended for FID stability)")
     p.add_argument("--num-classes", type=int, default=10)
     p.add_argument("--temperature", type=float, default=None,
                    help="Sampling temperature (if unset, sweeps [0.9..1.2])")
-    p.add_argument("--batch-size", type=int, default=10,
+    p.add_argument("--batch-size", type=int, default=5,
                    help="Batch size for generation")
     # Architecture (must match training)
     p.add_argument("--num-scales", type=int, default=3)
@@ -75,90 +197,26 @@ def load_real_images(eval_file: str, stats_file: str, data_root: str | None
     return real
 
 
-def extract_spectral_features(images: list[np.ndarray]) -> np.ndarray:
-    """Rich spectral features: mean, std, percentiles, inter-band correlation.
+def compute_fid(act_real: np.ndarray, act_gen: np.ndarray) -> float:
+    """Standard FID on InceptionV3 pool3 features.
 
-    Returns a 624-dim feature vector per image:
-    - mean per band (125)
-    - std per band (125)
-    - 25th percentile per band (125)
-    - 75th percentile per band (125)
-    - adjacent-band correlations (124)
+    Uses eps=1e-6 covariance regularisation to handle rank-deficient matrices
+    that arise from small sample counts relative to the 2048-d feature space.
+
+        FID = ||mu_r - mu_g||^2 + Tr(Σ_r + Σ_g − 2·sqrt(Σ_r · Σ_g))
     """
-    features = []
-    for img in images:
-        if img.shape[0] < img.shape[-1]:
-            pixels = img.reshape(-1, img.shape[-1])  # (H*W, C)
-        else:
-            pixels = img.reshape(img.shape[0], -1).T  # (H*W, C)
-        ch_mean = pixels.mean(axis=0)
-        ch_std = pixels.std(axis=0)
-        ch_p25 = np.percentile(pixels, 25, axis=0)
-        ch_p75 = np.percentile(pixels, 75, axis=0)
-        corr = np.array([
-            np.corrcoef(pixels[:, i], pixels[:, i + 1])[0, 1]
-            for i in range(pixels.shape[1] - 1)
-        ])
-        corr = np.nan_to_num(corr, nan=0.0)
-        feat = np.concatenate([ch_mean, ch_std, ch_p25, ch_p75, corr])
-        features.append(feat)
-    return np.array(features)
+    eps = 1e-6
+    mu_r = act_real.mean(0)
+    mu_g = act_gen.mean(0)
+    sig_r = np.cov(act_real, rowvar=False) + np.eye(act_real.shape[1]) * eps
+    sig_g = np.cov(act_gen,  rowvar=False) + np.eye(act_gen.shape[1])  * eps
 
-
-def extract_spatial_features(images: list[np.ndarray], spatial_size: int = 32) -> np.ndarray:
-    """Downsample to (spatial_size, spatial_size, C) and flatten."""
-    from scipy.ndimage import zoom
-
-    features = []
-    for img in images:
-        h, w = img.shape[:2]
-        factors = (spatial_size / h, spatial_size / w, 1.0)
-        img_small = zoom(img.astype(np.float64), factors, order=1)
-        features.append(img_small.ravel())
-    return np.array(features)
-
-
-def compute_fid(real_features: np.ndarray, fake_features: np.ndarray) -> float:
-    """Compute FID between two sets of feature vectors.
-
-    Applies PCA to reduce dimensionality (capped by sample count) before
-    computing the standard FID formula:
-        FID = ||mu_r - mu_f||^2 + Tr(Sigma_r + Sigma_f - 2*sqrt(Sigma_r @ Sigma_f))
-    """
-    from sklearn.decomposition import PCA
-
-    # PCA to make covariance tractable: max components = min(N_total - 1, D, 64)
-    n_total = real_features.shape[0] + fake_features.shape[0]
-    n_components = min(64, n_total - 1, real_features.shape[1])
-    n_real = real_features.shape[0]
-    combined = np.vstack([real_features, fake_features])
-    pca = PCA(n_components=n_components, random_state=42)
-    projected = pca.fit_transform(combined)
-    real_features = projected[:n_real]
-    fake_features = projected[n_real:]
-
-    mu_r = np.mean(real_features, axis=0)
-    mu_f = np.mean(fake_features, axis=0)
-
-    sigma_r = np.cov(real_features, rowvar=False) + np.eye(real_features.shape[1]) * 1e-6
-    sigma_f = np.cov(fake_features, rowvar=False) + np.eye(fake_features.shape[1]) * 1e-6
-
-    diff = mu_r - mu_f
-    mean_term = np.dot(diff, diff)
-
-    product = sigma_r @ sigma_f
-    covmean = linalg.sqrtm(product)
-
+    diff = mu_r - mu_g
+    covmean = linalg.sqrtm(sig_r @ sig_g)
     if np.iscomplexobj(covmean):
-        if np.max(np.abs(covmean.imag)) > 1e-3:
-            # SVD-based fallback for poorly conditioned matrices
-            U, s, Vt = np.linalg.svd(product)
-            covmean = (U * np.sqrt(np.maximum(s, 0.0))) @ Vt
-        covmean = np.real(covmean)
+        covmean = covmean.real
 
-    trace_term = np.trace(sigma_r + sigma_f - 2.0 * covmean)
-
-    return float(mean_term + trace_term)
+    return float(diff @ diff + np.trace(sig_r + sig_g - 2.0 * covmean))
 
 
 def main():
@@ -196,26 +254,28 @@ def main():
     if args.temperature is not None:
         temperatures = [args.temperature]
     else:
-        temperatures = [0.9, 0.95, 1.0, 1.05, 1.1, 1.15, 1.2]
+        temperatures = [0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
         print(f"Temperature sweep: {temperatures}")
 
-    # Pre-extract real features (both spectral and spatial)
-    real_spectral_by_class: dict[int, np.ndarray] = {}
-    real_spatial_by_class: dict[int, np.ndarray] = {}
+    # Pre-extract real InceptionV3 features per class
+    print("\nLoading InceptionV3 (pool3)...")
+    inc = InceptionPool3(device)
+    inc.eval()
+
+    print("Extracting real image features...")
+    real_act_by_class: dict[int, np.ndarray] = {}
     for cls, imgs in real_by_class.items():
-        real_spectral_by_class[cls] = extract_spectral_features(imgs)
-        real_spatial_by_class[cls] = extract_spatial_features(imgs)
+        real_act_by_class[cls] = get_activations(imgs, inc, device)
+        print(f"  class {cls}: {len(imgs)} images → {real_act_by_class[cls].shape}")
 
     # Generate and evaluate per class (with temperature sweep)
-    fid_spectral: dict[int, float] = {}
-    fid_spatial: dict[int, float] = {}
+    fid_scores: dict[int, float] = {}
     best_temps: dict[int, float] = {}
 
     for cls in range(args.num_classes):
         print(f"\nClass {cls}:")
-        rf_spec = real_spectral_by_class.get(cls)
-        rf_spat = real_spatial_by_class.get(cls)
-        if rf_spec is None:
+        act_real = real_act_by_class.get(cls)
+        if act_real is None:
             print(f"  WARNING: no real images for class {cls}, skipping")
             continue
 
@@ -227,35 +287,40 @@ def main():
             # Generate images at this temperature
             generated: list[np.ndarray] = []
             remaining = args.num_per_class
-            while remaining > 0:
+            max_retries = remaining * 3  # avoid infinite loop
+            attempts = 0
+            while remaining > 0 and attempts < max_retries:
                 bs = min(args.batch_size, remaining)
                 labels = torch.full((bs,), cls, dtype=torch.long, device=device)
-                with torch.no_grad():
-                    images = model.generate(labels, temperature=temp)
-                imgs_01 = images.cpu().permute(0, 2, 3, 1).numpy()
-                for i in range(bs):
-                    generated.append(imgs_01[i])
-                remaining -= bs
+                try:
+                    with torch.no_grad():
+                        images = model.generate(labels, temperature=temp)
+                    imgs_01 = images.cpu().permute(0, 2, 3, 1).numpy()
+                    for i in range(bs):
+                        generated.append(imgs_01[i])
+                    remaining -= bs
+                except RuntimeError as e:
+                    attempts += 1
+                    if attempts % 5 == 0:
+                        print(f"    WARNING: {attempts} generation failures at temp={temp:.2f}: {e}")
+                    continue
+            if remaining > 0:
+                print(f"    WARNING: only generated {len(generated)}/{args.num_per_class} at temp={temp:.2f}")
 
-            ff_spec = extract_spectral_features(generated)
-            fid_s = compute_fid(rf_spec, ff_spec)
+            act_gen = get_activations(generated, inc, device)
+            fid_val = compute_fid(act_real, act_gen)
 
             if len(temperatures) > 1:
-                print(f"  temp={temp:.2f} -> Spectral FID={fid_s:.2f}")
+                print(f"  temp={temp:.2f} -> FID={fid_val:.2f}")
 
-            if fid_s < best_fid:
-                best_fid = fid_s
+            if fid_val < best_fid:
+                best_fid = fid_val
                 best_temp = temp
                 best_generated = generated
 
-        # Compute spatial FID for the best-temperature samples
-        ff_spat = extract_spatial_features(best_generated)
-        spatial_score = compute_fid(rf_spat, ff_spat)
-
-        fid_spectral[cls] = best_fid
-        fid_spatial[cls] = spatial_score
+        fid_scores[cls] = best_fid
         best_temps[cls] = best_temp
-        print(f"  Best: temp={best_temp:.2f}, Spectral FID={best_fid:.2f}, Spatial FID={spatial_score:.2f}")
+        print(f"  Best: temp={best_temp:.2f}, FID={best_fid:.2f}")
 
         # Save best generated images (denormalized uint16)
         gen_dir = out_dir / f"generated/{cls}"
@@ -267,30 +332,25 @@ def main():
 
     # Summary
     print("\n" + "=" * 60)
-    print("Per-class FID scores:")
-    print(f"{'Class':<8} {'Spectral FID':<15} {'Spatial FID':<15} {'Temp':<6}")
-    print("-" * 44)
+    print("Per-class FID scores (InceptionV3 pool3, Kaggle metric):")
+    print(f"{'Class':<8} {'FID':<12} {'Temp':<6}")
+    print("-" * 26)
     for cls in range(args.num_classes):
-        spec = fid_spectral.get(cls, float("nan"))
-        spat = fid_spatial.get(cls, float("nan"))
-        temp = best_temps.get(cls, float("nan"))
-        print(f"{cls:<8} {spec:<15.2f} {spat:<15.2f} {temp:<6.2f}")
-    mean_spec = np.mean(list(fid_spectral.values()))
-    mean_spat = np.mean(list(fid_spatial.values()))
-    print("-" * 44)
-    print(f"{'Mean':<8} {mean_spec:<15.2f} {mean_spat:<15.2f}")
-    print(f"\nSpectral FID: rich spectral features (mean/std/percentiles/correlation, 624-dim)")
-    print(f"Spatial FID: 32x32 downsample + PCA")
+        score = fid_scores.get(cls, float("nan"))
+        temp  = best_temps.get(cls, float("nan"))
+        print(f"{cls:<8} {score:<12.2f} {temp:<6.2f}")
+    mean_fid = np.mean(list(fid_scores.values()))
+    print("-" * 26)
+    print(f"{'Mean':<8} {mean_fid:<12.2f}")
 
     # Save CSV
     csv_path = out_dir / "submission.csv"
     with open(csv_path, "w") as f:
-        f.write("class,spectral_fid,spatial_fid,temperature\n")
+        f.write("class,fid,temperature\n")
         for cls in range(args.num_classes):
-            spec = fid_spectral.get(cls, float("nan"))
-            spat = fid_spatial.get(cls, float("nan"))
-            temp = best_temps.get(cls, float("nan"))
-            f.write(f"{cls},{spec:.4f},{spat:.4f},{temp:.2f}\n")
+            score = fid_scores.get(cls, float("nan"))
+            temp  = best_temps.get(cls, float("nan"))
+            f.write(f"{cls},{score:.4f},{temp:.2f}\n")
     print(f"\nSaved submission to {csv_path}")
 
 

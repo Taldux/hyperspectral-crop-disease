@@ -2,8 +2,8 @@
 PyTorch dataset that loads .npy hyperspectral images on-the-fly.
 
 Each sample is a 128x128x125 uint16 image stored as an individual .npy file.
-The dataset normalizes to [0, 1] float32 using precomputed global min/max stats
-and returns tensors in (C, H, W) format for PyTorch convolutions.
+The dataset normalizes with precomputed statistics and returns tensors in
+(C, H, W) format for PyTorch convolutions.
 """
 
 import re
@@ -11,6 +11,36 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 from pathlib import Path
+
+
+def load_normalization_stats(stats_file: str) -> dict[str, np.ndarray | float | str]:
+    """Load normalization statistics, preferring per-band standardization."""
+    with np.load(stats_file) as stats:
+        if "per_band_mean" in stats and "per_band_std" in stats:
+            return {
+                "mode": "per-band-standard",
+                "per_band_mean": stats["per_band_mean"].astype(np.float32),
+                "per_band_std": stats["per_band_std"].astype(np.float32),
+            }
+        global_min = float(stats["global_min"])
+        global_max = float(stats["global_max"])
+        return {
+            "mode": "global-minmax",
+            "global_min": global_min,
+            "scale": global_max - global_min,
+        }
+
+
+def normalize_image(img: np.ndarray, stats: dict[str, np.ndarray | float | str]) -> np.ndarray:
+    """Normalize an HWC hyperspectral image using the configured stats."""
+    if stats["mode"] == "per-band-standard":
+        per_band_mean = np.asarray(stats["per_band_mean"], dtype=np.float32)
+        per_band_std = np.asarray(stats["per_band_std"], dtype=np.float32)
+        return (img - per_band_mean) / (per_band_std + 1e-8)
+
+    global_min = float(stats["global_min"])
+    scale = float(stats["scale"])
+    return (img - global_min) / (scale + 1e-8)
 
 
 class HyperspectralDataset(Dataset):
@@ -29,11 +59,7 @@ class HyperspectralDataset(Dataset):
         self.labels: list[int] = []
         self.transform = transform
 
-        # Load normalization stats
-        stats = np.load(stats_file)
-        self.global_min = float(stats["global_min"])
-        self.global_max = float(stats["global_max"])
-        self.scale = self.global_max - self.global_min
+        self.norm_stats = load_normalization_stats(stats_file)
 
         # Load file list
         with open(split_file, "r") as f:
@@ -62,9 +88,9 @@ class HyperspectralDataset(Dataset):
         return len(self.files)
 
     def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
-        # Load and normalize to [0, 1]
+        # Load and normalize.
         img = np.load(self.files[idx]).astype(np.float32)
-        img = (img - self.global_min) / (self.scale + 1e-8)
+        img = normalize_image(img, self.norm_stats)
 
         # (H, W, C) → (C, H, W) for PyTorch
         img = torch.from_numpy(img).permute(2, 0, 1)

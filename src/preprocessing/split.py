@@ -75,18 +75,23 @@ def create_split(data_dir: str | Path, out_dir: str | Path, val_ratio: float = V
     print(f"  eval: {len(eval_files)} samples -> {eval_path}")
 
     # --- Normalization stats ---
-    print("Computing global normalization stats...")
-    global_min, global_max = compute_global_stats(data_dir)
+    print("Computing per-band normalization stats (this may take a few minutes)...")
+    from .stats import compute_stats
+    stats = compute_stats(data_dir)
     np.savez(
         out_dir / "stats.npz",
-        global_min=global_min,
-        global_max=global_max,
+        global_min=stats["global_min"],
+        global_max=stats["global_max"],
+        per_band_mean=stats["per_band_mean"],
+        per_band_std=stats["per_band_std"],
     )
-    print(f"  Stats saved: min={global_min}, max={global_max}")
+    print(f"  Stats saved: global_min={stats['global_min']:.1f}, global_max={stats['global_max']:.1f}")
+    print(f"  Per-band mean range: [{stats['per_band_mean'].min():.1f}, {stats['per_band_mean'].max():.1f}]")
+    print(f"  Per-band std  range: [{stats['per_band_std'].min():.1f},  {stats['per_band_std'].max():.1f}]")
 
     # --- Summary ---
     print(f"\nDone. Files written to {out_dir}/")
     print(f"  train.txt  ({len(train_files)} samples)")
     print(f"  val.txt    ({len(val_files)} samples)")
     print(f"  eval.txt   ({len(eval_files)} samples)")
-    print(f"  stats.npz  (global_min={global_min}, global_max={global_max})")
+    print(f"  stats.npz  (per-band Z-score + global min/max)")
