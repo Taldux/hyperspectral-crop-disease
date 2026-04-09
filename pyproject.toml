@@ -10,6 +10,7 @@ dependencies = [
     "matplotlib>=3.10.8",
     "numpy>=2.4.2",
     "scikit-learn>=1.8.0",
+    "scipy>=1.17.0",
     "seaborn>=0.13.2",
     "spectral>=0.24",
     "torch>=2.10.0",
@@ -24,3 +25,8 @@ explicit = true
 
 [tool.uv.sources]
 torch = { index = "pytorch-cu128" }
+
+[dependency-groups]
+dev = [
+    "sphinx>=9.1.0",
+]
