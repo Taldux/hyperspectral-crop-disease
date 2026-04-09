@@ -1,7 +1,7 @@
 [project]
 name = "hyperspectral-crop-disease"
 version = "0.1.0"
-description = "Add your description here"
+description = "Conditional Glow training, evaluation, and analysis for hyperspectral crop disease generation"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
