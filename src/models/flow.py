@@ -2,6 +2,7 @@
 
 Multi-scale architecture (3 scales x K steps). Each step:
     ActNorm -> Invertible 1x1 Conv (LU) -> Affine Coupling
+
 Class-conditional via label embedding injected into coupling layers.
 """
 
