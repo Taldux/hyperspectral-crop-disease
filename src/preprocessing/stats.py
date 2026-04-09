@@ -1,11 +1,6 @@
-"""
-Compute normalization statistics across the training set.
+"""Compute normalization statistics across the training set.
 
-Produces both legacy global min/max and per-band mean/std (Z-score).
-Per-band Z-score is the correct normalisation for hyperspectral data:
-each band has a different physical scale, and squashing 125 bands into
-one global [0,1] range destroys the relative per-band signal that
-distinguishes diseased from healthy pixels.
+Produces global min/max and per-band mean/std (Welford online algorithm).
 """
 
 import numpy as np
@@ -17,20 +12,7 @@ NUM_BANDS = 125
 
 
 def compute_stats(data_dir: Path) -> dict:
-    """
-    Scan all training files and compute:
-      - global_min / global_max  (kept for backward compatibility)
-      - per_band_mean / per_band_std  (used for Z-score normalisation)
-
-    Uses Welford's online algorithm so the full dataset never has to
-    sit in memory at once.
-
-    Args:
-        data_dir: Root data directory containing a Train/ folder.
-
-    Returns:
-        Dict with keys: global_min, global_max, per_band_mean, per_band_std.
-    """
+    """Scan Train/ and return global_min, global_max, per_band_mean, per_band_std."""
     global_min = np.inf
     global_max = -np.inf
 

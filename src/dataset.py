@@ -1,9 +1,7 @@
-"""
-PyTorch dataset that loads .npy hyperspectral images on-the-fly.
+"""PyTorch dataset for .npy hyperspectral images.
 
-Each sample is a 128x128x125 uint16 image stored as an individual .npy file.
-The dataset normalizes with precomputed statistics and returns tensors in
-(C, H, W) format for PyTorch convolutions.
+Loads 128x128x125 uint16 samples on-the-fly, normalizes with precomputed
+stats, and returns (C, H, W) tensors.
 """
 
 import re
@@ -44,16 +42,7 @@ def normalize_image(img: np.ndarray, stats: dict[str, np.ndarray | float | str])
 
 
 class HyperspectralDataset(Dataset):
-    """Loads individual .npy files listed in a split file, normalizes on-the-fly.
-
-    Args:
-        split_file: Path to a .txt file with lines of "filepath\\tlabel".
-        stats_file: Path to stats.npz containing global_min and global_max.
-        data_root: Optional root directory. Paths in the split file that contain
-            'data/Train' or 'data/evaluation' will be re-rooted here.
-        transform: Optional callable applied to the tensor after normalization.
-    """
-
+    """Loads individual .npy files listed in a split file, normalizes on-the-fly."""
     def __init__(self, split_file: str, stats_file: str, data_root: str | None = None, transform=None):
         self.files: list[str] = []
         self.labels: list[int] = []
@@ -91,8 +80,7 @@ class HyperspectralDataset(Dataset):
         # Load and normalize.
         img = np.load(self.files[idx]).astype(np.float32)
         img = normalize_image(img, self.norm_stats)
-
-        # (H, W, C) → (C, H, W) for PyTorch
+        # (H, W, C) → (C, H, W)
         img = torch.from_numpy(img).permute(2, 0, 1)
         label = torch.tensor(self.labels[idx], dtype=torch.long)
 

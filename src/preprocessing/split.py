@@ -1,6 +1,4 @@
-"""
-Create stratified train/val/eval split index files.
-"""
+"""Create stratified train/val/eval split index files."""
 
 import numpy as np
 from pathlib import Path
@@ -12,24 +10,14 @@ VAL_RATIO = 0.15
 
 
 def create_split(data_dir: str | Path, out_dir: str | Path, val_ratio: float = VAL_RATIO):
-    """
-    Create train/val/eval splits as text files listing file paths and labels.
-
-    No data is copied. Only index files pointing to the original .npy files
-    are written, along with normalization statistics (stats.npz).
-
-    Args:
-        data_dir: Root data directory containing Train/ and evaluation/ folders.
-        out_dir: Directory to write split files and stats into.
-        val_ratio: Fraction of training data to reserve for validation.
-    """
-    from .stats import compute_global_stats
+    """Write train/val/eval index files and stats.npz to out_dir. No data is copied."""
+    from .stats import compute_stats
 
     data_dir = Path(data_dir)
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # --- Collect all training file paths and labels ---
+    # Collect training file paths and labels
     all_files: list[str] = []
     all_labels: list[int] = []
 
@@ -41,7 +29,7 @@ def create_split(data_dir: str | Path, out_dir: str | Path, val_ratio: float = V
 
     print(f"Found {len(all_files)} training samples across {NUM_CLASSES} classes")
 
-    # --- Stratified train/val split ---
+    # Stratified train/val split
     train_files, val_files, train_labels, val_labels = train_test_split(
         all_files, all_labels,
         test_size=val_ratio,
@@ -59,7 +47,7 @@ def create_split(data_dir: str | Path, out_dir: str | Path, val_ratio: float = V
                 f.write(f"{filepath}\t{label}\n")
         print(f"  {name}: {len(files)} samples -> {split_path}")
 
-    # --- Evaluation index ---
+    # Evaluation index
     eval_files: list[str] = []
     eval_labels: list[int] = []
     for class_id in range(NUM_CLASSES):
@@ -74,8 +62,8 @@ def create_split(data_dir: str | Path, out_dir: str | Path, val_ratio: float = V
             f.write(f"{filepath}\t{label}\n")
     print(f"  eval: {len(eval_files)} samples -> {eval_path}")
 
-    # --- Normalization stats ---
-    print("Computing per-band normalization stats (this may take a few minutes)...")
+    # Normalization stats
+    print("Computing per-band normalization stats")
     from .stats import compute_stats
     stats = compute_stats(data_dir)
     np.savez(
@@ -89,7 +77,6 @@ def create_split(data_dir: str | Path, out_dir: str | Path, val_ratio: float = V
     print(f"  Per-band mean range: [{stats['per_band_mean'].min():.1f}, {stats['per_band_mean'].max():.1f}]")
     print(f"  Per-band std  range: [{stats['per_band_std'].min():.1f},  {stats['per_band_std'].max():.1f}]")
 
-    # --- Summary ---
     print(f"\nDone. Files written to {out_dir}/")
     print(f"  train.txt  ({len(train_files)} samples)")
     print(f"  val.txt    ({len(val_files)} samples)")

@@ -1,10 +1,9 @@
-"""
-Training script for the Conditional Glow normalizing flow.
+"""Training script for the Conditional Glow normalizing flow.
 
 Usage:
-    python -m src.train_flow                                    # train from scratch
-    python -m src.train_flow --resume results/flow/best.pt      # resume
-    python -m src.train_flow --epochs 200 --batch-size 2 --grad-checkpoint
+    python -m src.train                                    # train from scratch
+    python -m src.train --resume results/flow/best.pt      # resume
+    python -m src.train --epochs 200 --batch-size 2 --grad-checkpoint
 """
 
 import argparse
@@ -86,7 +85,7 @@ def load_checkpoint(
 
 
 def warmup_lr_lambda(epoch: int, warmup: int) -> float:
-    """Linear warmup followed by constant 1.0 (cosine handled by scheduler)."""
+    """Linear warmup then constant 1.0 (cosine decay handled by scheduler)."""
     if epoch < warmup:
         return (epoch + 1) / warmup
     return 1.0
@@ -98,7 +97,7 @@ def train_one_epoch(
     optimizer: optim.Optimizer,
     device: torch.device,
 ) -> tuple[float, float, float]:
-    """Returns: mean_nll, mean_prior, mean_logdet (all nats/dim)."""
+    """Returns mean_nll, mean_prior, mean_logdet (nats/dim)."""
     model.train()
     total_nll = 0.0
     total_prior = 0.0
@@ -172,7 +171,7 @@ def generate_samples(
     num_per_class: int = 2,
     num_classes: int = 10,
 ):
-    """Generate a few sample images and save as .npy for inspection."""
+    """Generate a few samples per class and save as .npy for inspection."""
     import numpy as np
 
     sample_dir = out_dir / "samples" / f"epoch_{epoch:03d}"
@@ -183,7 +182,6 @@ def generate_samples(
         labels = torch.full((num_per_class,), cls, dtype=torch.long, device=device)
         images = model.generate(labels, temperature=temperature)
         for i, img in enumerate(images):
-            # (C, H, W) -> (H, W, C) and save
             arr = img.cpu().permute(1, 2, 0).numpy()
             np.save(sample_dir / f"class{cls}_sample{i}.npy", arr)
 
@@ -200,8 +198,7 @@ def main():
     print(f"Device: {device}")
 
     # Data
-    train_ds = HyperspectralDataset(
-        split_file=str(data_dir / "train.txt"),
+    train_ds = HyperspectralDataset(        split_file=str(data_dir / "train.txt"),
         stats_file=str(data_dir / "stats.npz"),
         data_root=args.data_root,
     )
@@ -242,8 +239,7 @@ def main():
         optimizer, [warmup, cosine], milestones=[args.warmup_epochs]
     )
 
-    # NOTE: AMP (float16) is intentionally disabled for normalizing flows.
-    # The chained exp/log operations in ActNorm + InvertibleConv overflow in fp16.
+    # NOTE: AMP (float16) disabled — chained exp/log ops in ActNorm + InvertibleConv overflow in fp16.
 
     # Resume
     start_epoch = 0

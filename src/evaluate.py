@@ -1,8 +1,6 @@
-"""
-Generate synthetic hyperspectral images and compute per-class FID.
+"""Generate synthetic hyperspectral images and compute per-class FID.
 
-Uses InceptionV3 pool3 features on SRF-projected RGB images —
-the same metric used in the Kaggle competition evaluation.
+Uses InceptionV3 pool3 features on SRF-projected RGB (Kaggle metric).
 
 Usage:
     python -m src.evaluate --checkpoint results/flow/epoch_125.pt
@@ -24,10 +22,8 @@ from torchvision.models import Inception_V3_Weights, inception_v3
 
 from src.models.flow import ConditionalGlow
 
-# ---------------------------------------------------------------------------
-# Spectral Response Functions (Sentinel-2 green / red / NIR approximation)
+# Spectral Response Functions (Sentinel-2 green / red / NIR)
 # Resampled from the competition's SRF table to 125 hyperspectral bands.
-# ---------------------------------------------------------------------------
 _SRF_GREEN = torch.tensor([
     0.0000, 0.0000, 0.0000, 0.0000, 0.0001, 0.0002, 0.0005, 0.0008, 0.0014, 0.0024, 0.0041,
     0.0069, 0.0113, 0.0180, 0.0279, 0.0414, 0.0583, 0.0783, 0.1008, 0.1252, 0.1507, 0.1766,
@@ -76,7 +72,7 @@ _SRF_RESAMPLED = {
 
 
 def hs_to_s2_rgb(hs_img: torch.Tensor) -> torch.Tensor:
-    """Project a (125, H, W) hyperspectral image to (3, H, W) Sentinel-2 RGB."""
+    """Project (125, H, W) hyperspectral image to (3, H, W) Sentinel-2 RGB."""
     if hs_img.shape[0] != 125:
         raise ValueError(f"Expected 125 spectral bands, got {hs_img.shape[0]}")
     out = []
@@ -86,9 +82,7 @@ def hs_to_s2_rgb(hs_img: torch.Tensor) -> torch.Tensor:
     return torch.stack(out)  # (3, H, W)
 
 
-# ---------------------------------------------------------------------------
 # InceptionV3 feature extractor (pool3, 2048-d)
-# ---------------------------------------------------------------------------
 
 class InceptionPool3(nn.Module):
     """InceptionV3 trimmed to pool3 output (2048-d). Frozen, eval-only."""
@@ -121,10 +115,7 @@ def get_activations(
     device: torch.device,
     batch_size: int = 8,
 ) -> np.ndarray:
-    """Extract InceptionV3 pool3 features from a list of (H, W, 125) float32 images.
-
-    Returns (N, 2048) array.
-    """
+    """Extract InceptionV3 pool3 features from (H,W,125) images. Returns (N, 2048)."""
     feats = []
     for i in range(0, len(images), batch_size):
         batch = images[i: i + batch_size]
@@ -133,8 +124,7 @@ def get_activations(
             torch.from_numpy(img.transpose(2, 0, 1))
             for img in batch
         ]).to(device)
-        rgb = torch.stack([hs_to_s2_rgb(img) for img in hs])  # (N, 3, H, W)
-        rgb = F.interpolate(rgb, size=(299, 299), mode="bilinear", align_corners=False)
+        rgb = torch.stack([hs_to_s2_rgb(img) for img in hs])  # (N, 3, H, W)        rgb = F.interpolate(rgb, size=(299, 299), mode="bilinear", align_corners=False)
         feats.append(model(rgb).cpu().numpy())
     return np.concatenate(feats, axis=0)
 
@@ -198,13 +188,7 @@ def load_real_images(eval_file: str, stats_file: str, data_root: str | None
 
 
 def compute_fid(act_real: np.ndarray, act_gen: np.ndarray) -> float:
-    """Standard FID on InceptionV3 pool3 features.
-
-    Uses eps=1e-6 covariance regularisation to handle rank-deficient matrices
-    that arise from small sample counts relative to the 2048-d feature space.
-
-        FID = ||mu_r - mu_g||^2 + Tr(Σ_r + Σ_g − 2·sqrt(Σ_r · Σ_g))
-    """
+    """FID on InceptionV3 pool3 features with eps=1e-6 covariance regularization."""
     eps = 1e-6
     mu_r = act_real.mean(0)
     mu_g = act_gen.mean(0)

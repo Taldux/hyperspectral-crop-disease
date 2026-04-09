@@ -1,7 +1,7 @@
 # Source
 
 - `dataset.py` — `HyperspectralDataset` (PyTorch Dataset, loads `.npy` files, normalizes to [0,1])
-- `train_flow.py` — Training script for `ConditionalGlow`
+- `train.py` — Training script for `ConditionalGlow`
 - `train_classifier.py` — Training script for `HybridCNNTransformer`
 - `evaluate.py` — Generate synthetic images and compute spectral + spatial FID scores
 - `evaluate_classifier.py` — Evaluate generated images using a classifier trained on real data (TRTR vs TRTS)
