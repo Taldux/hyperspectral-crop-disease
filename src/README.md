@@ -1,17 +1,14 @@
 # Source
 
-- `dataset.py` — `HyperspectralDataset` (PyTorch Dataset, loads `.npy` files, normalizes to [0,1])
-- `train.py` — Training script for `ConditionalGlow`
-- `train_classifier.py` — Training script for `HybridCNNTransformer`
-- `evaluate.py` — Generate synthetic images and compute spectral + spatial FID scores
-- `evaluate_classifier.py` — Evaluate generated images using a classifier trained on real data (TRTR vs TRTS)
+- `dataset.py` — `HyperspectralDataset` for loading `.npy` hyperspectral cubes from split files and normalizing them for PyTorch
+- `train.py` — training loop for the class-conditional `ConditionalGlow` model
+- `evaluate.py` — checkpoint evaluation and generation script using the competition-style FID pipeline
 
 ## `models/`
 
-- `flow.py` — `ConditionalGlow` normalizing flow (3 scales × 4 steps, class-conditional)
-- `classifier.py` — `HybridCNNTransformer` (CNN feature extractor + Transformer encoder + linear head)
+- `flow.py` — `ConditionalGlow` normalizing flow implementation with ActNorm, invertible `1x1` convolutions, affine coupling, and multi-scale sampling
 
 ## `preprocessing/`
 
-- `split.py` — Create train/val/eval split files
-- `stats.py` — Compute global min/max statistics for normalization
+- `split.py` — create `train.txt`, `val.txt`, `eval.txt`, and `stats.npz` from the repository data folders
+- `stats.py` — compute global min/max and per-band normalization statistics over the training set
